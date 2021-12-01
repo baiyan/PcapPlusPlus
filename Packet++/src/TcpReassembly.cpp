@@ -52,6 +52,7 @@ TcpReassembly::ReassemblyStatus TcpReassembly::reassemblePacket(Packet& tcpData)
 	{
 		if (time(NULL) >= m_PurgeTimepoint)
 		{
+			cleanUpActiveList();
 			purgeClosedConnections();
 			m_PurgeTimepoint = time(NULL) + PURGE_FREQ_SECS;
 		}
@@ -114,6 +115,8 @@ TcpReassembly::ReassemblyStatus TcpReassembly::reassemblePacket(Packet& tcpData)
 
 	// find the connection in the connection map
 	ConnectionList::iterator iter = m_ConnectionList.find(flowKey);
+
+	updateActiveList(flowKey);
 
 	if (iter == m_ConnectionList.end())
 	{
@@ -427,6 +430,348 @@ TcpReassembly::ReassemblyStatus TcpReassembly::reassemblePacket(Packet& tcpData)
 	}
 }
 
+TcpReassembly::ReassemblyStatus TcpReassembly::reassembleTcpPayload(TcpPayloadInfo *info, uint8_t *payload, size_t payload_size)
+{
+	// automatic cleanup
+	if (m_RemoveConnInfo == true)
+	{
+		if (time(NULL) >= m_PurgeTimepoint)
+		{
+			cleanUpActiveList();
+			purgeClosedConnections();
+			m_PurgeTimepoint = time(NULL) + PURGE_FREQ_SECS;
+		}
+	}
+
+	IPv4Address v4sip(info->src);
+	IPv4Address v4dip(info->dst);	
+	IPAddress srcIP = v4sip, dstIP = v4dip;
+
+
+	ReassemblyStatus status = TcpMessageHandled;
+
+	// set the TCP payload size
+	size_t tcpPayloadSize = payload_size;
+
+	// calculate if this packet has FIN or RST flags
+	bool isFin = info->fin;
+	bool isRst = info->rst;
+	bool isFinOrRst = isFin || isRst;
+	bool isSyn = info->syn;
+	// ignore ACK packets or TCP packets with no payload (except for SYN, FIN or RST packets which we'll later need)
+	if (tcpPayloadSize == 0 && !isSyn && !isFinOrRst)
+	{
+		return Ignore_PacketWithNoData;
+	}
+
+	TcpReassemblyData* tcpReassemblyData = NULL;
+
+	// calculate flow key for this packet
+	uint32_t flowKey = info->key;
+
+	// find the connection in the connection map
+	ConnectionList::iterator iter = m_ConnectionList.find(flowKey);
+
+	updateActiveList(flowKey);
+
+	if (iter == m_ConnectionList.end())
+	{
+		// if it's a packet of a new connection, create a TcpReassemblyData object and add it to the active connection list
+		std::pair<ConnectionList::iterator, bool> pair = m_ConnectionList.insert(std::make_pair(flowKey, TcpReassemblyData()));
+		tcpReassemblyData = &pair.first->second;
+		tcpReassemblyData->connData.srcIP = srcIP;
+		tcpReassemblyData->connData.dstIP = dstIP;
+		tcpReassemblyData->connData.srcPort = info->sport;
+		tcpReassemblyData->connData.dstPort = info->dport;
+		tcpReassemblyData->connData.flowKey = flowKey;
+
+		m_ConnectionInfo[flowKey] = tcpReassemblyData->connData;
+
+		// fire connection start callback
+		if (m_OnConnStart != NULL)
+			m_OnConnStart(tcpReassemblyData->connData, m_UserCookie);
+	}
+	else // connection already exists
+	{
+		// if this packet belongs to a connection that was already closed (for example: data packet that comes after FIN), ignore it.
+		if (iter->second.closed)
+		{
+			LOG_DEBUG("Ignoring packet of already closed flow [0x" << std::hex << flowKey << "]");
+			return Ignore_PacketOfClosedFlow;
+		}
+		tcpReassemblyData = &iter->second;
+	}
+
+	int8_t sideIndex = -1;
+	bool first = false;
+
+	// calculate packet's source port
+	uint16_t srcPort = info->sport;
+
+	// if this is a new connection and it's the first packet we see on that connection
+	if (tcpReassemblyData->numOfSides == 0)
+	{
+		LOG_DEBUG("Setting side for new connection");
+
+		// open the first side of the connection, side index is 0
+		sideIndex = 0;
+		tcpReassemblyData->twoSides[sideIndex].srcIP = srcIP;
+		tcpReassemblyData->twoSides[sideIndex].srcPort = srcPort;
+		tcpReassemblyData->numOfSides++;
+		first = true;
+	}
+	// if there is already one side in this connection (which will be at side index 0)
+	else if (tcpReassemblyData->numOfSides == 1)
+	{
+		// check if packet belongs to that side
+		if (tcpReassemblyData->twoSides[0].srcPort == srcPort && tcpReassemblyData->twoSides[0].srcIP == srcIP)
+		{
+			sideIndex = 0;
+		}
+		else
+		{
+			// this means packet belong to the second side which doesn't yet exist. Open a second side with side index 1
+			LOG_DEBUG("Setting second side of a connection");
+			sideIndex = 1;
+			tcpReassemblyData->twoSides[sideIndex].srcIP = srcIP;
+			tcpReassemblyData->twoSides[sideIndex].srcPort = srcPort;
+			tcpReassemblyData->numOfSides++;
+			first = true;
+		}
+	}
+	// if there are already 2 sides open for this connection
+	else if (tcpReassemblyData->numOfSides == 2)
+	{
+		// check if packet matches side 0
+		if (tcpReassemblyData->twoSides[0].srcPort == srcPort && tcpReassemblyData->twoSides[0].srcIP == srcIP)
+		{
+			sideIndex = 0;
+		}
+		// check if packet matches side 1
+		else if (tcpReassemblyData->twoSides[1].srcPort == srcPort && tcpReassemblyData->twoSides[1].srcIP == srcIP)
+		{
+			sideIndex = 1;
+		}
+		// packet doesn't match either side. This case doesn't make sense but it's handled anyway. Packet will be ignored
+		else
+		{
+			LOG_ERROR("Error occurred - packet doesn't match either side of the connection!!");
+			return Error_PacketDoesNotMatchFlow;
+		}
+	}
+	// there are more than 2 side - this case doesn't make sense and shouldn't happen, but handled anyway. Packet will be ignored
+	else
+	{
+		LOG_ERROR("Error occurred - connection has more than 2 sides!!");
+		return Error_PacketDoesNotMatchFlow;
+	}
+
+	// if this side already got FIN or RST packet before, ignore this packet as this side is considered closed
+	if (tcpReassemblyData->twoSides[sideIndex].gotFinOrRst)
+	{
+		LOG_DEBUG("Got a packet after FIN or RST were already seen on this side (" << sideIndex << "). Ignoring this packet");
+		return Ignore_PacketOfClosedFlow;
+	}
+
+	// handle FIN/RST packets that don't contain additional TCP data
+	if (isFinOrRst && tcpPayloadSize == 0)
+	{
+		LOG_DEBUG("Got FIN or RST packet without data on side " << sideIndex);
+
+		handleFinOrRst(tcpReassemblyData, sideIndex, flowKey);
+		return FIN_RSTWithNoData;
+	}
+
+	// check if this packet contains data from a different side than the side seen before.
+	// If this is the case then treat the out-of-order packet list as missing data and send them to the user (callback) together with an indication that some data was missing.
+	// Why? because a new packet from the other side means the previous message was probably already received and a new message is starting.
+	// In this case out-of-order packets are probably actually missing data
+	// For example: let's assume these are HTTP messages. If we're seeing the first packet of a response this means the server has already received the full request and is now starting
+	// to send the response. So if we still have out-of-order packets from the request it probably means that some packets were lost during the capture. So we don't expect the client to
+	// continue sending packets of the previous request, so we'll treat the out-of-order packets as missing data
+	//
+	// I'm aware that there are edge cases where the situation I described above is not true, but at some point we must clean the out-of-order packet list to avoid memory leak.
+	// I decided to do what Wireshark does and clean this list when starting to see a message from the other side
+	if (!first && tcpPayloadSize > 0 && tcpReassemblyData->prevSide != -1 && tcpReassemblyData->prevSide != sideIndex &&
+			tcpReassemblyData->twoSides[tcpReassemblyData->prevSide].tcpFragmentList.size() > 0)
+	{
+		LOG_DEBUG("Seeing a first data packet from a different side. Previous side was " << tcpReassemblyData->prevSide << ", current side is " << sideIndex);
+		checkOutOfOrderFragments(tcpReassemblyData, tcpReassemblyData->prevSide, true);
+	}
+	tcpReassemblyData->prevSide = sideIndex;
+
+	// extract sequence value from packet
+	uint32_t sequence = be32toh(info->sequence);
+
+	// if it's the first packet we see on this side of the connection
+	if (first)
+	{
+		LOG_DEBUG("First data from this side of the connection");
+
+		// set initial sequence
+		tcpReassemblyData->twoSides[sideIndex].sequence = sequence + tcpPayloadSize;
+		if (isSyn)
+			tcpReassemblyData->twoSides[sideIndex].sequence++;
+
+		// send data to the callback
+		if (tcpPayloadSize != 0 && m_OnMessageReadyCallback != NULL)
+		{
+			TcpStreamData streamData(payload, tcpPayloadSize, 0, tcpReassemblyData->connData);
+			m_OnMessageReadyCallback(sideIndex, streamData, m_UserCookie);
+		}
+		status = TcpMessageHandled;
+
+		// handle case where this packet is FIN or RST (although it's unlikely)
+		if (isFinOrRst)
+			handleFinOrRst(tcpReassemblyData, sideIndex, flowKey);
+		
+		// return - nothing else to do here
+		return status;
+	}
+
+	// if packet sequence is smaller than expected - this means that part or all of the TCP data is being re-transmitted
+	if (SEQ_LT(sequence, tcpReassemblyData->twoSides[sideIndex].sequence))
+	{
+		LOG_DEBUG("Found new data with the sequence lower than expected");
+
+		// calculate the sequence after this packet to see if this TCP payload contains also new data
+		uint32_t newSequence = sequence + tcpPayloadSize;
+
+		// this means that some of payload is new
+		if (SEQ_GT(newSequence, tcpReassemblyData->twoSides[sideIndex].sequence))
+		{
+			// calculate the size of the new data
+			uint32_t newLength = tcpReassemblyData->twoSides[sideIndex].sequence - sequence;
+
+			LOG_DEBUG("Although sequence is lower than expected payload is long enough to contain new data. Calling the callback with the new data");
+
+			// update the sequence for this side to include the new data that was seen
+			tcpReassemblyData->twoSides[sideIndex].sequence += tcpPayloadSize - newLength;
+
+			// send only the new data to the callback
+			if (m_OnMessageReadyCallback != NULL)
+			{
+				TcpStreamData streamData(payload + newLength, tcpPayloadSize - newLength, 0, tcpReassemblyData->connData);
+				m_OnMessageReadyCallback(sideIndex, streamData, m_UserCookie);
+			}
+			status = TcpMessageHandled;
+		}
+		else
+		{
+			status = Ignore_Retransimission;
+		}
+
+		// handle case where this packet is FIN or RST
+		if (isFinOrRst)
+			handleFinOrRst(tcpReassemblyData, sideIndex, flowKey);
+			
+		// return - nothing else to do here
+		return status;
+	}
+
+	// if packet sequence is exactly as expected - this is the "good" case and the most common one
+	else if (sequence == tcpReassemblyData->twoSides[sideIndex].sequence)
+	{
+		// if TCP data size is 0 - nothing to do
+		if (tcpPayloadSize == 0)
+		{
+			LOG_DEBUG("Payload length is 0, doing nothing");
+
+			// handle case where this packet is FIN or RST
+			if (isFinOrRst)
+			{
+				handleFinOrRst(tcpReassemblyData, sideIndex, flowKey);
+				status = FIN_RSTWithNoData;
+			}
+			else
+			{
+				status = Ignore_PacketWithNoData;
+			}
+
+			return status;
+		}
+
+		LOG_DEBUG("Found new data with expected sequence. Calling the callback");
+
+		// update the sequence for this side to include TCP data from this packet
+		tcpReassemblyData->twoSides[sideIndex].sequence += tcpPayloadSize;
+
+		// if this is a SYN packet - add +1 to the sequence
+		if (isSyn)
+			tcpReassemblyData->twoSides[sideIndex].sequence++;
+
+		// send the data to the callback
+		if (m_OnMessageReadyCallback != NULL)
+		{
+			TcpStreamData streamData(payload, tcpPayloadSize, 0, tcpReassemblyData->connData);
+			m_OnMessageReadyCallback(sideIndex, streamData, m_UserCookie);
+		}
+		status = TcpMessageHandled;
+
+		// now that we've seen new data, go over the list of out-of-order packets and see if one or more of them fits now
+		checkOutOfOrderFragments(tcpReassemblyData, sideIndex, false);
+
+		// handle case where this packet is FIN or RST
+		if (isFinOrRst)
+			handleFinOrRst(tcpReassemblyData, sideIndex, flowKey);
+
+		// return - nothing else to do here
+		return status;
+	}
+
+	// this case means sequence size of the packet is higher than expected which means the packet is out-of-order or some packets were lost (missing data).
+	// we don't know which of the 2 cases it is at this point so we just add this data to the out-of-order packet list
+	else
+	{
+		// if TCP data size is 0 - nothing to do
+		if (tcpPayloadSize == 0)
+		{
+			LOG_DEBUG("Payload length is 0, doing nothing");
+
+			// handle case where this packet is FIN or RST
+			if (isFinOrRst)
+			{
+				handleFinOrRst(tcpReassemblyData, sideIndex, flowKey);
+				status = FIN_RSTWithNoData;
+			}
+			else
+			{
+				status = Ignore_PacketWithNoData;
+			}
+
+			return status;
+		}
+
+		// create a new TcpFragment, copy the TCP data to it and add this packet to the the out-of-order packet list
+		TcpFragment* newTcpFrag = new TcpFragment();
+		newTcpFrag->data = new uint8_t[tcpPayloadSize];
+		newTcpFrag->dataLength = tcpPayloadSize;
+		newTcpFrag->sequence = sequence;
+		memcpy(newTcpFrag->data, payload, tcpPayloadSize);
+		tcpReassemblyData->twoSides[sideIndex].tcpFragmentList.pushBack(newTcpFrag);
+
+		LOG_DEBUG("Found out-of-order packet and added a new TCP fragment with size " << tcpPayloadSize << " to the out-of-order list of side " << sideIndex);
+		status = OutOfOrderTcpMessageBuffered;
+
+		// check if we've stored too many out-of-order fragments; if so, consider missing packets lost and
+		// continue processing until the number of stored fragments is lower than the acceptable limit again
+		if (m_MaxOutOfOrderFragments > 0 && tcpReassemblyData->twoSides[sideIndex].tcpFragmentList.size() > m_MaxOutOfOrderFragments)
+		{
+			checkOutOfOrderFragments(tcpReassemblyData, sideIndex, false);
+		}
+
+		// handle case where this packet is FIN or RST
+		if (isFinOrRst)
+		{
+			handleFinOrRst(tcpReassemblyData, sideIndex, flowKey);
+		}
+
+		return status;
+	}
+}
+
+
+
 TcpReassembly::ReassemblyStatus TcpReassembly::reassemblePacket(RawPacket* tcpRawData)
 {
 	Packet parsedPacket(tcpRawData, false);
@@ -710,6 +1055,42 @@ int TcpReassembly::isConnectionOpen(const ConnectionData& connection) const
 
 	return -1;
 }
+
+/* add by frank */
+
+int TcpReassembly::cleanUpActiveList()
+{
+	int count = 0;
+	time_t now = time(NULL);
+	for (ActiveList::iterator iterItem = m_ActiveList.begin(); 
+			iterItem != m_ActiveList.end();) {
+		time_t touch = iterItem->first;
+		if (touch + 600 < now) {
+			uint32_t key = iterItem->second;
+			insertIntoCleanupList(key);
+			m_ActiveList.erase(iterItem);
+			++count;
+		} else {
+			++iterItem;
+		}
+	}
+	return count;
+}
+
+void TcpReassembly::updateActiveList(uint32_t flowKey)
+{
+	ActiveList::reverse_iterator iterItem = m_ActiveList.rbegin();
+	for (; iterItem != m_ActiveList.rend(); ++iterItem) {
+		if (iterItem->second == flowKey) {
+			std::advance(iterItem, 1);
+			m_ActiveList.erase(iterItem.base());
+			break;
+		}
+	}
+	m_ActiveList.push_back(std::make_pair(time(NULL), flowKey));
+}
+
+/* add by frank */
 
 void TcpReassembly::insertIntoCleanupList(uint32_t flowKey)
 {

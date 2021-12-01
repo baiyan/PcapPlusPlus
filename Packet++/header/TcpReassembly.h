@@ -333,6 +333,22 @@ public:
 	 */
 	TcpReassembly(OnTcpMessageReady onMessageReadyCallback, void* userCookie = NULL, OnTcpConnectionStart onConnectionStartCallback = NULL, OnTcpConnectionEnd onConnectionEndCallback = NULL, const TcpReassemblyConfiguration &config = TcpReassemblyConfiguration());
 
+
+	/* add by frank */
+	typedef struct {
+		uint32_t src;
+		uint32_t dst;
+		uint32_t key;
+		uint16_t sport;
+		uint16_t dport;
+		uint32_t sequence;
+		bool fin;
+		bool syn;
+		bool rst;
+	} TcpPayloadInfo;
+	ReassemblyStatus reassembleTcpPayload(TcpPayloadInfo *info, uint8_t *payload, size_t payload_size);
+	/* add by frank */
+
 	/**
 	 * The most important method of this class which gets a packet from the user and processes it. If this packet opens a new connection, ends a connection or contains new data on an
 	 * existing connection, the relevant callback will be called (TcpReassembly#OnTcpMessageReady, TcpReassembly#OnTcpConnectionStart, TcpReassembly#OnTcpConnectionEnd)
@@ -418,6 +434,11 @@ private:
 	typedef std::map<uint32_t, TcpReassemblyData> ConnectionList;
 	typedef std::map<time_t, std::list<uint32_t> > CleanupList;
 
+	/* add by frank */
+	typedef std::list<std::pair<time_t, uint32_t> > ActiveList;
+	ActiveList m_ActiveList;
+	/* add by frank */
+
 	OnTcpMessageReady m_OnMessageReadyCallback;
 	OnTcpConnectionStart m_OnConnStart;
 	OnTcpConnectionEnd m_OnConnEnd;
@@ -438,6 +459,11 @@ private:
 	void closeConnectionInternal(uint32_t flowKey, ConnectionEndReason reason);
 
 	void insertIntoCleanupList(uint32_t flowKey);
+
+	/* add by frank */
+	int cleanUpActiveList();
+	void updateActiveList(uint32_t flowKey);
+	/* add by frank */
 };
 
 }

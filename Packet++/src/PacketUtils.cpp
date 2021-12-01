@@ -117,6 +117,23 @@ uint32_t hash5Tuple(Packet* packet, bool const& directionUnique)
 	{
 		if (portDst < portSrc)
 			srcPosition = 1;
+		/* add by frank */
+		else if (portDst == portSrc) {
+			IPAddress src, dst;
+			IPv4Layer* ipv4Layer = packet->getLayerOfType<IPv4Layer>();
+			if (ipv4Layer != NULL) {
+				src = ipv4Layer->getSrcIPAddress();
+				dst = ipv4Layer->getDstIPAddress();
+			} else {
+				IPv6Layer* ipv6Layer = packet->getLayerOfType<IPv6Layer>();
+				src = ipv6Layer->getSrcIPAddress();
+				dst = ipv6Layer->getDstIPAddress();
+			}
+			if (memcmp(&dst, &src, sizeof(IPAddress)) < 0) {
+				srcPosition = 1;
+			}
+		}
+		/* add by frank */
 	}
 
 	vec[0 + srcPosition].buffer = (uint8_t*)&portSrc;
